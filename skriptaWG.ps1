@@ -1,16 +1,18 @@
-﻿#requires -RunAsAdministrator
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)]
+  # Pot do WireGuard .conf datoteke (opcijsko).
+  # Ce je ne podas, skripta poisce .conf v isti mapi, kjer je skripta:
+  #   ena  -> vzame to, vec -> ponudi izbiro, nobena -> vprasa za pot.
   [ValidateScript({ Test-Path $_ -PathType Leaf })]
   [string]$ConfigPath,
 
-  # Opcijsko - ce ga ne podas, te skripta na zacetku vprasa za mail.
+  # Opcijsko - ce ga ne podas, te skripta na zacetku vprasa za mail
+  # (in predlaga trenutno prijavljenega uporabnika).
   # Lokalno: "PC\user" ali "user"
   # Entra:   "ime.priimek@podjetje.si" ali "AzureAD\ime.priimek@podjetje.si"
   [string]$User,
 
-  # Ustvari VPN_ON/VPN_OFF na Public Desktop (opcijsko)
+  # Ustvari VPN_ON/VPN_OFF na namizju uporabnika (opcijsko)
   [switch]$CreateDesktopButtons,
 
   # Odstrani in ponovno namesti tunel service (opcijsko)
@@ -20,6 +22,31 @@ param(
   # (priporočeno)
   [switch]$GrantServiceAcl = $true
 )
+
+# ---- Self-elevate: ce skripta ni zagnana kot admin, se sama ponovno zazene kot admin ----
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+  [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+  $cmd = "& '" + ($PSCommandPath -replace "'", "''") + "'"
+  foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+    if ($kv.Value -is [System.Management.Automation.SwitchParameter]) {
+      $cmd += " -$($kv.Key):`$$($kv.Value.IsPresent.ToString().ToLower())"
+    } else {
+      $val = [string]$kv.Value
+      # admin okno se zazene v System32, zato relativno pot spremenimo v polno
+      if ($kv.Key -eq 'ConfigPath') { $val = (Resolve-Path -LiteralPath $val).ProviderPath }
+      $cmd += " -$($kv.Key) '" + ($val -replace "'", "''") + "'"
+    }
+  }
+  try {
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`""
+  } catch {
+    Write-Host "Skripta potrebuje admin pravice (UAC je bil zavrnjen)." -ForegroundColor Red
+    Read-Host "Pritisni Enter za izhod" | Out-Null
+  }
+  exit
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -44,6 +71,64 @@ function Find-WireGuardExe {
 function Enable-LimitedOperatorUI {
   reg add "HKLM\SOFTWARE\WireGuard" /v LimitedOperatorUI /t REG_DWORD /d 1 /f | Out-Null
   reg add "HKLM\SOFTWARE\WOW6432Node\WireGuard" /v LimitedOperatorUI /t REG_DWORD /d 1 /f | Out-Null
+}
+
+# Poisce .conf v mapi skripte. Ena -> vzame jo, vec -> izbira, nobena -> vprasa za pot.
+function Select-ConfigFile {
+  $confs = @()
+  if ($PSScriptRoot) {
+    $confs = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter *.conf -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Extension -eq '.conf' })
+  }
+
+  if ($confs.Count -eq 1) {
+    Write-Host "Najden config: $($confs[0].FullName)" -ForegroundColor Green
+    return $confs[0].FullName
+  }
+
+  if ($confs.Count -gt 1) {
+    Write-Host "V mapi je vec .conf datotek:"
+    for ($i = 0; $i -lt $confs.Count; $i++) {
+      Write-Host ("  [{0}] {1}" -f ($i + 1), $confs[$i].Name)
+    }
+    while ($true) {
+      $sel = Read-Host "Izberi stevilko"
+      $n = 0
+      if ([int]::TryParse($sel, [ref]$n) -and $n -ge 1 -and $n -le $confs.Count) {
+        return $confs[$n - 1].FullName
+      }
+      Write-Host "Neveljavna izbira." -ForegroundColor Yellow
+    }
+  }
+
+  Write-Host "V mapi skripte ni nobene .conf datoteke." -ForegroundColor Yellow
+  while ($true) {
+    $p = Read-Host "Vpisi pot do .conf datoteke (lahko jo povleces v to okno)"
+    if ($p) { $p = $p.Trim().Trim('"').Trim("'") }
+    if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) {
+      return (Resolve-Path -LiteralPath $p).ProviderPath
+    }
+    Write-Host "Datoteke ne najdem: $p" -ForegroundColor Yellow
+  }
+}
+
+# Tunel-servis bere .conf iz te poti ob vsakem zagonu -> ne sme biti na USB/omreznem disku.
+function Test-ConfigLocation([string]$Path) {
+  $risky = $false
+  if ($Path -like '\\*') {
+    $risky = $true
+  } else {
+    try {
+      $drive = New-Object System.IO.DriveInfo ([IO.Path]::GetPathRoot($Path))
+      if ($drive.DriveType -eq [IO.DriveType]::Removable -or $drive.DriveType -eq [IO.DriveType]::Network) { $risky = $true }
+    } catch { }
+  }
+
+  if ($risky) {
+    Write-Warning "Config je na USB ali omreznem disku. Tunel ga bere ob vsakem zagonu, zato VPN ne bo delal, ko disk odstranis. Kopiraj mapo na lokalni disk (npr. C:\WG) in zazeni znova."
+    $ans = Read-Host "Vseeno nadaljujem? [d/N]"
+    if ($ans -notmatch '^[DdYy]') { throw "Prekinjeno." }
+  }
 }
 
 function Resolve-UserSid([string]$InputUser) {
@@ -71,11 +156,38 @@ function Resolve-UserSid([string]$InputUser) {
   throw "Uporabnika ne morem prevesti v SID. Naj se vsaj 1x prijavi na ta računalnik. Poskušeno: $($candidates -join ', ')"
 }
 
-# Vprasa za mail, ga takoj preveri (SID) in ob napaki vprasa znova,
+# Predlog za mail: trenutno prijavljen uporabnik (lastnik explorer.exe).
+# Za Entra (AzureAD) uporabnike prebere mail (UPN) iz IdentityStore cache.
+function Get-LoggedOnUserSuggestion {
+  try {
+    $proc = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop | Select-Object -First 1
+    if (-not $proc) { return $null }
+
+    $sid = (Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop).Sid
+    if ($sid) {
+      $key = "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$sid\IdentityCache\$sid"
+      $upn = (Get-ItemProperty -Path $key -Name UserName -ErrorAction SilentlyContinue).UserName
+      if ($upn -and $upn -match '@') { return $upn }
+    }
+
+    $owner = Invoke-CimMethod -InputObject $proc -MethodName GetOwner -ErrorAction Stop
+    if ($owner.User -and $owner.Domain -and $owner.Domain -ne 'AzureAD') {
+      return "$($owner.Domain)\$($owner.User)"
+    }
+  } catch { }
+  return $null
+}
+
+# Vprasa za mail (Enter = predlog), ga takoj preveri (SID) in ob napaki vprasa znova,
 # da ni treba ponovno zaganjati skripte zaradi tipkarske napake.
-function Read-TargetUser {
+function Read-TargetUser([string]$Suggestion) {
   while ($true) {
-    $in = Read-Host "Vpisi mail uporabnika (npr. ime.priimek@podjetje.si)"
+    if ($Suggestion) {
+      $in = Read-Host "Mail uporabnika [Enter = $Suggestion]"
+      if ([string]::IsNullOrWhiteSpace($in)) { $in = $Suggestion }
+    } else {
+      $in = Read-Host "Vpisi mail uporabnika (npr. ime.priimek@podjetje.si)"
+    }
     if ($in) { $in = $in.Trim() }
 
     if ([string]::IsNullOrWhiteSpace($in)) {
@@ -102,6 +214,32 @@ function Read-TargetUser {
       return [PSCustomObject]@{ Input = $in; Resolved = $resolved }
     }
   }
+}
+
+# Namizje izbranega uporabnika (uposteva tudi OneDrive preusmeritev namizja).
+function Get-UserDesktopPath([string]$Sid) {
+  $profilePath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid" -ErrorAction SilentlyContinue).ProfileImagePath
+
+  # 1) iz uporabnikovega registra (na voljo, ko je uporabnik prijavljen)
+  $raw = $null
+  try {
+    $usf = Get-Item -Path "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction Stop
+    $raw = $usf.GetValue('Desktop', $null, 'DoNotExpandEnvironmentNames')
+  } catch { }
+
+  if ($raw) {
+    if ($profilePath) { $raw = $raw -ireplace [regex]::Escape('%USERPROFILE%'), $profilePath }
+    $path = [Environment]::ExpandEnvironmentVariables($raw)
+    if (Test-Path -LiteralPath $path -PathType Container) { return $path }
+  }
+
+  # 2) fallback: <profil>\Desktop
+  if ($profilePath) {
+    $path = Join-Path $profilePath 'Desktop'
+    if (Test-Path -LiteralPath $path -PathType Container) { return $path }
+  }
+
+  return $null
 }
 
 function Ensure-NetworkConfigOperators([string]$Account) {
@@ -239,102 +377,109 @@ function Grant-TunnelServiceRights([string]$ServiceName, [System.Security.Princi
 
 # ---------------- MAIN ----------------
 
-$wgExe = Find-WireGuardExe
-$tunnelName = [IO.Path]::GetFileNameWithoutExtension($ConfigPath)
-
-# 0) Uporabnik: ce ni podan z -User, ga vprasamo za mail
-if ([string]::IsNullOrWhiteSpace($User)) {
-  $answer = Read-TargetUser
-  $User = $answer.Input
-  $res  = $answer.Resolved
-  Write-Host ""
-} else {
-  # Resolve SID + canonical account
-  $res = Resolve-UserSid -InputUser $User
-}
-
-Write-Host "ConfigPath   : $ConfigPath"
-Write-Host "TunnelName   : $tunnelName"
-Write-Host "User (input) : $User"
-Write-Host "WireGuard EXE: $wgExe"
-Write-Host ""
-
-Write-Host "User (resolved): $($res.Account)"
-Write-Host "User SID       : $($res.Sid)"
-
-# 1) Ensure NCO membership (ključni del za GUI)
-Write-Host "Ensuring user is in 'Network Configuration Operators'..."
-$added = Ensure-NetworkConfigOperators -Account $res.Account
-if ($added) { Write-Host "User added to Network Configuration Operators." } else { Write-Host "User already in Network Configuration Operators." }
-
-# 2) Enable LimitedOperatorUI (GUI allow)
-Write-Host "Enabling LimitedOperatorUI..."
-Enable-LimitedOperatorUI
-
-# 3) Install tunnel service (if missing)
-if ($ForceReinstallTunnel) {
-  Write-Host "ForceReinstallTunnel: uninstall + install"
-  try { & "$wgExe" /uninstalltunnelservice "$tunnelName" | Out-Null } catch { }
-  Start-Sleep -Milliseconds 500
-}
-
-$serviceName = Get-TunnelServiceName -TunnelName $tunnelName
-if (-not $serviceName) {
-  Write-Host "Installing tunnel service..."
-  & "$wgExe" /installtunnelservice "$ConfigPath" | Out-Null
-  Start-Sleep -Seconds 1
-  $serviceName = Get-TunnelServiceName -TunnelName $tunnelName
-}
-
-if (-not $serviceName) { throw "Tunel-servisa ne najdem. Preveri .conf in ime tunela." }
-
-Write-Host "Tunnel service: $serviceName"
-
-# 4) Manual startup (ni always-on)
-Set-Service -Name $serviceName -StartupType Manual
-
-# 5) Optional: grant service ACL (da deluje sc start/stop, gumbi, ipd.)
-if ($GrantServiceAcl) {
-  Write-Host "Granting Start/Stop/Query rights on tunnel service..."
-  Grant-TunnelServiceRights -ServiceName $serviceName -SidObj $res.SidObj
-  Write-Host "Tunnel service rights updated."
-}
-
-# 6) Optional: desktop buttons
-if ($CreateDesktopButtons) {
-
-  $explorer = Get-Process explorer -IncludeUserName | Select-Object -First 1
-
-  if (-not $explorer) {
-    throw "Ne najdem trenutno prijavljenega uporabnika. Explorer.exe ni zagnan."
-  }
-
-  $loggedOnUser = $explorer.UserName.Split("\")[-1]
-  $UserDesktop = Join-Path "C:\Users\$loggedOnUser" "Desktop"
-
-  if (-not (Test-Path $UserDesktop)) {
-    throw "Desktop mapa ne obstaja: $UserDesktop"
-  }
-
-  Set-Content (Join-Path $UserDesktop "VPN_ON.bat")  "sc start `"$serviceName`"" -Encoding ASCII
-  Set-Content (Join-Path $UserDesktop "VPN_OFF.bat") "sc stop `"$serviceName`""  -Encoding ASCII
-
-  Write-Host "Created VPN_ON/VPN_OFF on $UserDesktop"
-}
-
-
-# 7) Restart manager (prebere LimitedOperatorUI)
 try {
-  Restart-Service WireGuardManager -Force
-  Write-Host "WireGuardManager restarted."
-} catch {
-  Write-Host "WireGuardManager restart skipped."
-}
+  $wgExe = Find-WireGuardExe
 
-Write-Host ""
-Write-Host "DONE."
-Write-Host "Obvezno: REBOOT (da se osveži group membership v tokenu)."
-Write-Host "Test kot uporabnik:"
-Write-Host "  whoami /groups | findstr /i `"Network Configuration Operators`""
-Write-Host "  sc start `"$serviceName`""
-Write-Host "  sc stop  `"$serviceName`""
+  # 0a) Config: ce ni podan z -ConfigPath, ga poiscemo v mapi skripte
+  if (-not $ConfigPath) { $ConfigPath = Select-ConfigFile }
+  $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).ProviderPath
+  Test-ConfigLocation -Path $ConfigPath
+  $tunnelName = [IO.Path]::GetFileNameWithoutExtension($ConfigPath)
+  Write-Host ""
+
+  # 0b) Uporabnik: ce ni podan z -User, ga vprasamo za mail
+  if ([string]::IsNullOrWhiteSpace($User)) {
+    $answer = Read-TargetUser -Suggestion (Get-LoggedOnUserSuggestion)
+    $User = $answer.Input
+    $res  = $answer.Resolved
+    Write-Host ""
+  } else {
+    # Resolve SID + canonical account
+    $res = Resolve-UserSid -InputUser $User
+  }
+
+  Write-Host "ConfigPath   : $ConfigPath"
+  Write-Host "TunnelName   : $tunnelName"
+  Write-Host "User (input) : $User"
+  Write-Host "WireGuard EXE: $wgExe"
+  Write-Host ""
+
+  Write-Host "User (resolved): $($res.Account)"
+  Write-Host "User SID       : $($res.Sid)"
+
+  # 1) Ensure NCO membership (ključni del za GUI)
+  Write-Host "Ensuring user is in 'Network Configuration Operators'..."
+  $added = Ensure-NetworkConfigOperators -Account $res.Account
+  if ($added) { Write-Host "User added to Network Configuration Operators." } else { Write-Host "User already in Network Configuration Operators." }
+
+  # 2) Enable LimitedOperatorUI (GUI allow)
+  Write-Host "Enabling LimitedOperatorUI..."
+  Enable-LimitedOperatorUI
+
+  # 3) Install tunnel service (if missing)
+  if ($ForceReinstallTunnel) {
+    Write-Host "ForceReinstallTunnel: uninstall + install"
+    try { & "$wgExe" /uninstalltunnelservice "$tunnelName" | Out-Null } catch { }
+    Start-Sleep -Milliseconds 500
+  }
+
+  $serviceName = Get-TunnelServiceName -TunnelName $tunnelName
+  if (-not $serviceName) {
+    Write-Host "Installing tunnel service..."
+    & "$wgExe" /installtunnelservice "$ConfigPath" | Out-Null
+    Start-Sleep -Seconds 1
+    $serviceName = Get-TunnelServiceName -TunnelName $tunnelName
+  }
+
+  if (-not $serviceName) { throw "Tunel-servisa ne najdem. Preveri .conf in ime tunela." }
+
+  Write-Host "Tunnel service: $serviceName"
+
+  # 4) Manual startup (ni always-on)
+  Set-Service -Name $serviceName -StartupType Manual
+
+  # 5) Optional: grant service ACL (da deluje sc start/stop, gumbi, ipd.)
+  if ($GrantServiceAcl) {
+    Write-Host "Granting Start/Stop/Query rights on tunnel service..."
+    Grant-TunnelServiceRights -ServiceName $serviceName -SidObj $res.SidObj
+    Write-Host "Tunnel service rights updated."
+  }
+
+  # 6) Optional: gumbi na namizju izbranega uporabnika
+  if ($CreateDesktopButtons) {
+    $UserDesktop = Get-UserDesktopPath -Sid $res.Sid
+    if ($UserDesktop) {
+      Set-Content (Join-Path $UserDesktop "VPN_ON.bat")  "sc start `"$serviceName`"" -Encoding ASCII
+      Set-Content (Join-Path $UserDesktop "VPN_OFF.bat") "sc stop `"$serviceName`""  -Encoding ASCII
+      Write-Host "Created VPN_ON/VPN_OFF on $UserDesktop"
+    } else {
+      Write-Warning "Namizja za $($res.Account) ne najdem - gumbov VPN_ON/VPN_OFF nisem ustvaril."
+    }
+  }
+
+  # 7) Restart manager (prebere LimitedOperatorUI)
+  try {
+    Restart-Service WireGuardManager -Force
+    Write-Host "WireGuardManager restarted."
+  } catch {
+    Write-Host "WireGuardManager restart skipped."
+  }
+
+  Write-Host ""
+  Write-Host "DONE." -ForegroundColor Green
+  Write-Host "Test kot uporabnik (po restartu):"
+  Write-Host "  whoami /groups | findstr /i `"Network Configuration Operators`""
+  Write-Host "  sc start `"$serviceName`""
+  Write-Host "  sc stop  `"$serviceName`""
+  Write-Host ""
+
+  # 8) Restart racunalnika (potreben, da se osvezi group membership v tokenu)
+  $rb = Read-Host "Za delovanje je potreben restart. Ponovno zazenem racunalnik zdaj? (neshranjeno delo se izgubi) [d/N]"
+  if ($rb -match '^[DdYy]') { Restart-Computer -Force }
+}
+catch {
+  Write-Host ""
+  Write-Host "NAPAKA: $($_.Exception.Message)" -ForegroundColor Red
+  Read-Host "Pritisni Enter za izhod" | Out-Null
+  exit 1
+}
