@@ -2,9 +2,12 @@
 .SYNOPSIS
     Opomnik - preprost opomnik za dnevna opravila.
 .DESCRIPTION
-    Vpišeš opravila in uro. Ob tisti uri se čez CEL zaslon (na vseh monitorjih)
-    prikaže velik rdeč opomnik z zvokom. Ne da se ga zapreti z Alt+F4 ali Esc -
+    Vpišeš opravila in uro. Ob tisti uri se prikaže VELIKO rdeče okno z opomnikom
+    (privzeto spodaj desno), ki je vedno na vrhu, utripa in se ne zapre samo od sebe -
     klikniti moraš "OPRAVLJENO" ali ga odložiti (5 min / 15 min / 1 uro).
+
+    Ne prekrije celega zaslona in ne vzame fokusa: če tipkaš ali si na klicu,
+    lahko normalno nadaljuješ. Okno lahko z miško povlečeš drugam.
 
     Program teče v ozadju, ikona je v sistemski vrstici (spodaj desno ob uri).
     Podatki se shranjujejo v %APPDATA%\Opomnik\opomnik.json
@@ -46,24 +49,33 @@ $script:StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Opomni
 $script:DateFmt    = 'yyyy-MM-dd HH:mm'
 $script:Inv        = [System.Globalization.CultureInfo]::InvariantCulture
 
-$script:Tasks    = New-Object System.Collections.ArrayList
-$script:Settings = [pscustomobject]@{ Sound = $true }
+# kje na zaslonu se pokaže opomnik
+$script:PositionNames = [ordered]@{
+    BottomRight = 'spodaj desno'
+    TopRight    = 'zgoraj desno'
+    TopCenter   = 'zgoraj na sredini'
+    Center      = 'na sredini zaslona'
+}
 
-$script:AlertForms      = @()
+$script:Tasks    = New-Object System.Collections.ArrayList
+$script:Settings = [pscustomobject]@{ Sound = $true; Position = 'BottomRight' }
+
+$script:AlertForm       = $null
 $script:AlertTask       = $null
 $script:AlertIsTest     = $false
 $script:AlertAllowClose = $false
 $script:AlertShownAt    = [datetime]::MinValue
 $script:AlertTicks      = 0
 $script:Player          = $null
-$script:SoundMode       = 'none'
 $script:LastSound       = [datetime]::MinValue
+$script:DragOffset      = $null
 $script:ReallyExit      = $false
 $script:TrayHintShown   = $false
 $script:LastDay         = (Get-Date).Date
 
 $script:ColorA = [System.Drawing.Color]::FromArgb(183, 28, 28)
 $script:ColorB = [System.Drawing.Color]::FromArgb(211, 47, 47)
+$script:Pink   = [System.Drawing.Color]::FromArgb(255, 205, 210)
 
 # ---------------------------------------------------------------------------
 # Pomožne funkcije
@@ -141,8 +153,10 @@ function Load-Data {
         $raw = [System.IO.File]::ReadAllText($script:DataFile)
         if ([string]::IsNullOrWhiteSpace($raw)) { return }
         $data = $raw | ConvertFrom-Json
-        if ($null -ne $data.Settings -and $null -ne $data.Settings.Sound) {
-            $script:Settings.Sound = [bool]$data.Settings.Sound
+        if ($null -ne $data.Settings) {
+            if ($null -ne $data.Settings.Sound) { $script:Settings.Sound = [bool]$data.Settings.Sound }
+            $pos = [string]$data.Settings.Position
+            if ($pos -and $script:PositionNames.Contains($pos)) { $script:Settings.Position = $pos }
         }
         # opravljena opravila, starejša od 7 dni, pospravimo
         $cutoff = (Get-Date).Date.AddDays(-7)
@@ -240,21 +254,91 @@ function New-AppIcon {
 }
 
 # ---------------------------------------------------------------------------
-# VELIK OPOMNIK čez cel zaslon
+# OKNO Z OPOMNIKOM
+# Posebna vrsta okna, ki je vedno na vrhu, a se pokaže BREZ kraje fokusa -
+# tipkanje gre naprej v program, v katerem delaš.
+# Če tega ni mogoče pripraviti, se uporabi navadno okno (ki ob prikazu vzame fokus).
 # ---------------------------------------------------------------------------
+$script:NoActivate = $false
+try {
+    if (-not ('OpomnikPopupForm' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class OpomnikPopupForm : Form
+{
+    // show the window without stealing keyboard focus
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x08000000;     // WS_EX_NOACTIVATE
+            cp.ExStyle |= 0x00000080;     // WS_EX_TOOLWINDOW (not in Alt+Tab)
+            cp.ExStyle |= 0x00000008;     // WS_EX_TOPMOST
+            cp.ClassStyle |= 0x00020000;  // CS_DROPSHADOW
+            return cp;
+        }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+    // bring back on top (HWND_TOPMOST) without activating
+    public void KeepOnTop()
+    {
+        if (IsHandleCreated)
+            SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040);
+    }
+}
+'@
+    }
+    $script:NoActivate = $true
+} catch {
+    Write-ErrorLog "Posebnega okna ni bilo mogoče pripraviti, uporabim navadno: $_"
+}
+
+# Okno lahko z miško povlečeš kamorkoli.
+$script:DragDown = {
+    param($s, $e)
+    if ($e.Button -eq 'Left') {
+        $frm = $s.FindForm()
+        $p = [System.Windows.Forms.Cursor]::Position
+        $script:DragOffset = New-Object System.Drawing.Point(($p.X - $frm.Left), ($p.Y - $frm.Top))
+    }
+}
+$script:DragMove = {
+    param($s, $e)
+    if ($null -ne $script:DragOffset -and $e.Button -eq 'Left') {
+        $frm = $s.FindForm()
+        $p = [System.Windows.Forms.Cursor]::Position
+        $frm.Location = New-Object System.Drawing.Point(($p.X - $script:DragOffset.X), ($p.Y - $script:DragOffset.Y))
+    }
+}
+$script:DragUp = { $script:DragOffset = $null }
+
+function Add-DragHandlers($Control) {
+    $Control.Add_MouseDown($script:DragDown)
+    $Control.Add_MouseMove($script:DragMove)
+    $Control.Add_MouseUp($script:DragUp)
+}
 
 # Največja pisava, pri kateri se besedilo še prilega v okvir.
-function Get-FittingFont([string]$Text, [int]$MaxWidth, [int]$MaxHeight, [int]$StartSize) {
+function Get-FittingFont([string]$Text, [int]$MaxWidth, [int]$MaxHeight, [int]$StartSize, [int]$MinSize) {
     $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak
     $size = $StartSize
-    while ($size -gt 18) {
+    while ($size -gt $MinSize) {
         $font = New-Object System.Drawing.Font('Segoe UI', $size, [System.Drawing.FontStyle]::Bold)
         $measured = [System.Windows.Forms.TextRenderer]::MeasureText($Text, $font, (New-Object System.Drawing.Size($MaxWidth, 0)), $flags)
         if ($measured.Height -le $MaxHeight -and $measured.Width -le $MaxWidth) { return $font }
         $font.Dispose()
-        $size -= 4
+        $size -= 2
     }
-    return New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)
+    return New-Object System.Drawing.Font('Segoe UI', $MinSize, [System.Drawing.FontStyle]::Bold)
 }
 
 function New-AlertLabel([string]$Text, $Font, $Color) {
@@ -263,159 +347,131 @@ function New-AlertLabel([string]$Text, $Font, $Color) {
     $lbl.Font        = $Font
     $lbl.ForeColor   = $Color
     $lbl.BackColor   = [System.Drawing.Color]::Transparent
-    $lbl.TextAlign   = 'MiddleCenter'
+    $lbl.TextAlign   = 'MiddleLeft'
     $lbl.AutoSize    = $false
     $lbl.UseMnemonic = $false
+    Add-DragHandlers $lbl
     return $lbl
 }
 
-function New-AlertForm($Screen, [string]$TaskText, [string]$When) {
-    $b = $Screen.Bounds
-    $w = $b.Width
-    $h = $b.Height
-    $white = [System.Drawing.Color]::White
-    $pink  = [System.Drawing.Color]::FromArgb(255, 205, 210)
+function New-AlertButton([string]$Text, $Font, $BackColor, $ForeColor) {
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text      = $Text
+    $btn.Font      = $Font
+    $btn.BackColor = $BackColor
+    $btn.ForeColor = $ForeColor
+    $btn.FlatStyle = 'Flat'
+    $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $btn.Enabled   = $false   # vklopi se po 1 s (da ga ne potrdiš po nesreči)
+    return $btn
+}
 
-    $f = New-Object System.Windows.Forms.Form
+function New-AlertForm([string]$TaskText, [string]$Head) {
+    $W = 590
+    $H = 300
+    $white = [System.Drawing.Color]::White
+
+    if ($script:NoActivate) {
+        # "vedno na vrhu" je že vgrajeno v OpomnikPopupForm (TopMost tu ne sme biti
+        # nastavljen, ker bi okno ob prikazu vzelo fokus)
+        $f = New-Object OpomnikPopupForm
+    } else {
+        $f = New-Object System.Windows.Forms.Form
+        $f.TopMost = $true
+    }
     $f.Text            = 'Opomnik'
     $f.FormBorderStyle = 'None'
     $f.StartPosition   = 'Manual'
-    $f.Bounds          = $b
-    $f.TopMost         = $true
     $f.ShowInTaskbar   = $false
+    $f.ClientSize      = New-Object System.Drawing.Size($W, $H)
     $f.BackColor       = $script:ColorA
     $f.Icon            = $script:AppIcon
+    $f.Cursor          = [System.Windows.Forms.Cursors]::SizeAll
+    Add-DragHandlers $f
 
-    # Alt+F4 / zapiranje ne deluje - zapre se samo z gumbom
+    # Alt+F4 ne deluje - zapre se samo z gumbom
     $f.Add_FormClosing({
         param($s, $e)
         if (-not $script:AlertAllowClose -and $e.CloseReason -ne 'WindowsShutDown') { $e.Cancel = $true }
     })
 
-    # naslov
-    $lbl = New-AlertLabel 'OPOMNIK' (New-Object System.Drawing.Font('Segoe UI', 24, [System.Drawing.FontStyle]::Bold)) $pink
-    $lbl.SetBounds(0, [int]($h * 0.07), $w, [int]($h * 0.08))
+    # svetel rob okoli okna
+    $f.Add_Paint({
+        param($s, $e)
+        $pen = New-Object System.Drawing.Pen($script:Pink, 4)
+        $e.Graphics.DrawRectangle($pen, 2, 2, $s.ClientSize.Width - 4, $s.ClientSize.Height - 4)
+        $pen.Dispose()
+    })
+
+    # zgornja vrstica: OPOMNIK · danes 14:30 · zamuda ...
+    $lbl = New-AlertLabel $Head (New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)) $script:Pink
+    $lbl.SetBounds(20, 14, $W - 40, 26)
     $f.Controls.Add($lbl)
 
     # besedilo opravila - čim večje
-    $textW = [int]($w * 0.9)
-    $textH = [int]($h * 0.36)
-    $startSize = [int][Math]::Min(90, $h / 12)
-    $font = Get-FittingFont -Text $TaskText -MaxWidth ($textW - 20) -MaxHeight ($textH - 10) -StartSize $startSize
+    $font = Get-FittingFont -Text $TaskText -MaxWidth ($W - 50) -MaxHeight 134 -StartSize 30 -MinSize 12
     $lbl = New-AlertLabel $TaskText $font $white
-    $lbl.SetBounds([int](($w - $textW) / 2), [int]($h * 0.16), $textW, $textH)
-    $f.Controls.Add($lbl)
-
-    # kdaj je bilo predvideno
-    $lbl = New-AlertLabel $When (New-Object System.Drawing.Font('Segoe UI', 20)) $pink
-    $lbl.SetBounds(0, [int]($h * 0.53), $w, [int]($h * 0.08))
+    $lbl.SetBounds(20, 44, $W - 40, 140)
     $f.Controls.Add($lbl)
 
     # gumb OPRAVLJENO
-    $doneW = [int][Math]::Min(620, $w * 0.45)
-    $doneH = [int][Math]::Max(90, $h * 0.11)
-    $doneY = [int]($h * 0.63)
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text      = 'OPRAVLJENO'
-    $btn.Font      = New-Object System.Drawing.Font('Segoe UI', 28, [System.Drawing.FontStyle]::Bold)
-    $btn.BackColor = $white
-    $btn.ForeColor = $script:ColorA
-    $btn.FlatStyle = 'Flat'
+    $btn = New-AlertButton 'OPRAVLJENO' (New-Object System.Drawing.Font('Segoe UI', 18, [System.Drawing.FontStyle]::Bold)) $white $script:ColorA
     $btn.FlatAppearance.BorderSize = 0
-    $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
-    $btn.Enabled   = $false   # vklopi se po 2 s (da ga ne potrdiš po nesreči med tipkanjem)
-    $btn.SetBounds([int](($w - $doneW) / 2), $doneY, $doneW, $doneH)
+    $btn.SetBounds(20, 198, 250, 82)
     $btn.Add_Click({ Close-Alert 'done' })
     $f.Controls.Add($btn)
 
     # gumbi za odlog
-    $snoozeOptions = @(
-        @(5,  'Odloži 5 min'),
-        @(15, 'Odloži 15 min'),
-        @(60, 'Odloži 1 uro')
-    )
-    $snW = 230
-    $snH = [int][Math]::Max(48, $h * 0.06)
-    $gap = 24
-    $snY = $doneY + $doneH + [int]($h * 0.04)
-    $x = [int](($w - ($snoozeOptions.Count * $snW + ($snoozeOptions.Count - 1) * $gap)) / 2)
-    foreach ($opt in $snoozeOptions) {
-        $btn = New-Object System.Windows.Forms.Button
-        $btn.Text      = $opt[1]
-        $btn.Tag       = $opt[0]
-        $btn.Font      = New-Object System.Drawing.Font('Segoe UI', 14)
-        $btn.BackColor = [System.Drawing.Color]::FromArgb(127, 0, 0)
-        $btn.ForeColor = $white
-        $btn.FlatStyle = 'Flat'
-        $btn.FlatAppearance.BorderColor = $pink
+    $lbl = New-AlertLabel 'Odloži za:' (New-Object System.Drawing.Font('Segoe UI', 9)) $script:Pink
+    $lbl.SetBounds(290, 196, 280, 22)
+    $f.Controls.Add($lbl)
+
+    $x = 290
+    foreach ($opt in @(@(5, '5 min'), @(15, '15 min'), @(60, '1 uro'))) {
+        $btn = New-AlertButton $opt[1] (New-Object System.Drawing.Font('Segoe UI', 12)) ([System.Drawing.Color]::FromArgb(127, 0, 0)) $white
+        $btn.Tag = $opt[0]
+        $btn.FlatAppearance.BorderColor = $script:Pink
         $btn.FlatAppearance.BorderSize  = 2
-        $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
-        $btn.Enabled   = $false
-        $btn.SetBounds($x, $snY, $snW, $snH)
+        $btn.SetBounds($x, 220, 88, 60)
         $btn.Add_Click({ param($s, $e) Close-Alert 'snooze' ([int]$s.Tag) })
         $f.Controls.Add($btn)
-        $x += $snW + $gap
+        $x += 96
     }
-
-    $lbl = New-AlertLabel 'To okno se ne zapre, dokler ne izbereš ene od možnosti.' (New-Object System.Drawing.Font('Segoe UI', 11)) $pink
-    $lbl.SetBounds(0, [int]($h * 0.92), $w, [int]($h * 0.05))
-    $f.Controls.Add($lbl)
 
     return $f
 }
 
-function Start-AlertSound {
-    $script:SoundMode = 'none'
-    $script:LastSound = [datetime]::MinValue
+function Set-AlertPosition($Form) {
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $m = 16
+    $w = $Form.Width
+    $h = $Form.Height
+    switch ($script:Settings.Position) {
+        'TopRight'  { $x = $wa.Right - $w - $m;                     $y = $wa.Top + $m }
+        'TopCenter' { $x = $wa.Left + [int](($wa.Width - $w) / 2); $y = $wa.Top + $m }
+        'Center'    { $x = $wa.Left + [int](($wa.Width - $w) / 2); $y = $wa.Top + [int](($wa.Height - $h) / 2) }
+        default     { $x = $wa.Right - $w - $m;                     $y = $wa.Bottom - $h - $m }
+    }
+    $Form.Location = New-Object System.Drawing.Point($x, $y)
+}
+
+# Kratek zvonec (ne dolg alarm - da ne moti, če si na klicu).
+function Play-AlertSound {
+    $script:LastSound = Get-Date
     if (-not $script:Settings.Sound) { return }
     try {
         if ($null -eq $script:Player) {
-            $wav = Join-Path $env:WINDIR 'Media\Alarm01.wav'
-            if (Test-Path $wav) { $script:Player = New-Object System.Media.SoundPlayer($wav) }
+            foreach ($name in @('Windows Notify Calendar.wav', 'Windows Notify System Generic.wav', 'Alarm01.wav')) {
+                $wav = Join-Path $env:WINDIR "Media\$name"
+                if (Test-Path $wav) { $script:Player = New-Object System.Media.SoundPlayer($wav); break }
+            }
         }
-        if ($null -ne $script:Player) {
-            $script:Player.PlayLooping()
-            $script:SoundMode = 'loop'
-        } else {
-            $script:SoundMode = 'beep'
-        }
-    } catch {
-        $script:SoundMode = 'beep'
-    }
+        if ($null -ne $script:Player) { $script:Player.Play() } else { [System.Media.SystemSounds]::Exclamation.Play() }
+    } catch { }
 }
 
 function Stop-AlertSound {
     try { if ($null -ne $script:Player) { $script:Player.Stop() } } catch { }
-    $script:SoundMode = 'none'
-}
-
-# Zvok: prvo minuto neprestano, potem enkrat na minuto, dokler ne potrdiš.
-function Update-AlertSound([double]$Elapsed) {
-    $sinceLast = ((Get-Date) - $script:LastSound).TotalSeconds
-    switch ($script:SoundMode) {
-        'loop' {
-            if ($Elapsed -ge 60) {
-                $script:Player.Stop()
-                $script:SoundMode = 'reminder'
-                $script:LastSound = Get-Date
-            }
-        }
-        'beep' {
-            if ($Elapsed -ge 60) {
-                $script:SoundMode = 'reminder'
-                $script:LastSound = Get-Date
-            } elseif ($sinceLast -ge 3) {
-                [System.Media.SystemSounds]::Exclamation.Play()
-                $script:LastSound = Get-Date
-            }
-        }
-        'reminder' {
-            if ($sinceLast -ge 60) {
-                if ($null -ne $script:Player) { $script:Player.Play() } else { [System.Media.SystemSounds]::Exclamation.Play() }
-                $script:LastSound = Get-Date
-            }
-        }
-    }
 }
 
 function Show-Alert($Task, [switch]$Test) {
@@ -424,34 +480,34 @@ function Show-Alert($Task, [switch]$Test) {
     $script:AlertAllowClose = $false
     $script:AlertShownAt    = Get-Date
     $script:AlertTicks      = 0
-    $script:AlertForms      = @()
 
     if ($Test) {
-        $when = 'To je preizkus - tako bo videti opomnik.'
+        $head = 'OPOMNIK  ·  preizkus'
     } else {
+        $now  = Get-Date
         $due  = ConvertTo-Date $Task.Due
-        $when = 'Predvideno ' + (Format-Day $due) + ' ob ' + $due.ToString('HH:mm')
-        $late = [int][Math]::Floor(((Get-Date) - $due).TotalMinutes)
-        if ($late -ge 2) { $when += '   (zamuda ' + (Format-Duration $late) + ')' }
+        $head = 'OPOMNIK  ·  ' + (Format-When $due)
+        $late = [int][Math]::Floor(($now - $due).TotalMinutes)
+        if ($late -ge 2) { $head += '  ·  zamuda ' + (Format-Duration $late) }
+        $others = @($script:Tasks | Where-Object { -not $_.Done -and $_.Id -ne $Task.Id -and (Get-AlertTime $_) -le $now }).Count
+        if ($others -gt 0) { $head += "  ·  še $others v vrsti" }
     }
 
     try {
-        # na vse zaslone, glavni zaslon prvi
-        $screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { -not $_.Primary }
-        foreach ($scr in $screens) {
-            $f = New-AlertForm -Screen $scr -TaskText $Task.Text -When $when
-            $script:AlertForms += $f
-            $f.Show()
-        }
-        $script:AlertForms[0].Activate()
-        Start-AlertSound
+        $f = New-AlertForm -TaskText $Task.Text -Head $head
+        Set-AlertPosition $f
+        $script:AlertForm = $f
+        $f.Show()
+        Play-AlertSound
         $script:AlertTimer.Start()
     } catch {
-        # Rezerva: če velikega okna ni mogoče prikazati, vsaj navadno okno na vrhu.
+        # Rezerva: če okna ni mogoče prikazati, vsaj navadno sporočilo na vrhu.
         Write-ErrorLog "Prikaz opomnika ni uspel: $_"
-        $script:AlertAllowClose = $true
-        foreach ($f in @($script:AlertForms)) { try { $f.Close() } catch { } }
-        $script:AlertForms = @()
+        if ($null -ne $script:AlertForm) {
+            $script:AlertAllowClose = $true
+            try { $script:AlertForm.Close() } catch { }
+        }
+        $script:AlertForm = $null
         [void][System.Windows.Forms.MessageBox]::Show($Task.Text, 'OPOMNIK', 'OK', 'Warning', 'Button1', 'ServiceNotification')
         Close-Alert 'done'
     }
@@ -471,36 +527,33 @@ function Show-TestAlert {
 
 # Kliče se 2x na sekundo, dokler je opomnik odprt.
 function Update-Alert {
-    if ($script:AlertForms.Count -eq 0) { return }
+    $f = $script:AlertForm
+    if ($null -eq $f) { return }
     $script:AlertTicks++
     $elapsed = ((Get-Date) - $script:AlertShownAt).TotalSeconds
 
-    # gumbi začnejo delovati po 2 sekundah
-    if ($elapsed -ge 2) {
-        foreach ($f in $script:AlertForms) {
-            foreach ($c in $f.Controls) {
-                if ($c -is [System.Windows.Forms.Button] -and -not $c.Enabled) { $c.Enabled = $true }
-            }
+    # gumbi začnejo delovati po 1 sekundi
+    if ($elapsed -ge 1) {
+        foreach ($c in $f.Controls) {
+            if ($c -is [System.Windows.Forms.Button] -and -not $c.Enabled) { $c.Enabled = $true }
         }
     }
 
-    # počasno utripanje ozadja (vsako sekundo)
+    # počasno utripanje (vsako sekundo)
     if ($script:AlertTicks % 2 -eq 0) {
-        $color = if ($script:AlertTicks % 4 -eq 0) { $script:ColorA } else { $script:ColorB }
-        foreach ($f in $script:AlertForms) { $f.BackColor = $color }
+        $color = $script:ColorB
+        if ($script:AlertTicks % 4 -eq 0) { $color = $script:ColorA }
+        $f.BackColor = $color
     }
 
-    # če ga je kaj prekrilo ali minimiziralo, ga spet postavimo na vrh
-    if ($script:AlertTicks % 4 -eq 0 -and $null -eq [System.Windows.Forms.Form]::ActiveForm) {
-        foreach ($f in $script:AlertForms) {
-            if ($f.WindowState -ne 'Normal') { $f.WindowState = 'Normal' }
-            $f.TopMost = $false
-            $f.TopMost = $true
-        }
-        $script:AlertForms[0].Activate()
+    # vsake 3 s: če ga je kaj prekrilo ali skrilo, ga spet postavimo na vrh (brez kraje fokusa)
+    if ($script:AlertTicks % 6 -eq 0) {
+        if ($f.WindowState -eq 'Minimized') { $f.WindowState = 'Normal' }
+        if ($script:NoActivate) { $f.KeepOnTop() }
     }
 
-    Update-AlertSound $elapsed
+    # zvonec se ponovi vsaki 2 minuti, dokler ne potrdiš
+    if (((Get-Date) - $script:LastSound).TotalSeconds -ge 120) { Play-AlertSound }
 }
 
 function Close-Alert([string]$Action, [int]$Minutes = 0) {
@@ -516,13 +569,24 @@ function Close-Alert([string]$Action, [int]$Minutes = 0) {
     }
     $script:AlertTimer.Stop()
     Stop-AlertSound
-    $script:AlertAllowClose = $true
-    foreach ($f in @($script:AlertForms)) { $f.Close() }
-    $script:AlertForms      = @()
-    $script:AlertTask       = $null
-    $script:AlertAllowClose = $false
+    if ($null -ne $script:AlertForm) {
+        $script:AlertAllowClose = $true
+        $script:AlertForm.Close()
+        $script:AlertAllowClose = $false
+    }
+    $script:AlertForm = $null
+    $script:AlertTask = $null
     Refresh-List
     Update-Status
+}
+
+# Če je opravilo, ki je trenutno na opomniku, medtem izbrisano ali označeno
+# kot opravljeno v glavnem oknu, opomnik zapremo.
+function Test-AlertObsolete {
+    $t = $script:AlertTask
+    if ($null -eq $t -or $script:AlertIsTest) { return $false }
+    if ($t.Done) { return $true }
+    return -not ($script:Tasks | Where-Object { $_.Id -eq $t.Id })
 }
 
 # ---------------------------------------------------------------------------
@@ -637,6 +701,7 @@ function Switch-SelectedDone {
         $t.SnoozeUntil = ''
     }
     Save-Data
+    if (Test-AlertObsolete) { Close-Alert 'none' }
     Refresh-List
     Update-Status
 }
@@ -651,6 +716,7 @@ function Remove-SelectedTasks {
         if ($ids -contains $script:Tasks[$i].Id) { $script:Tasks.RemoveAt($i) }
     }
     Save-Data
+    if (Test-AlertObsolete) { Close-Alert 'none' }
     Refresh-List
     Update-Status
 }
@@ -700,8 +766,8 @@ $form.Text          = 'Opomnik'
 $form.Icon          = $script:AppIcon
 $form.StartPosition = 'CenterScreen'
 $form.Font          = New-Object System.Drawing.Font('Segoe UI', 10)
-$form.ClientSize    = New-Object System.Drawing.Size(660, 520)
-$form.MinimumSize   = New-Object System.Drawing.Size(580, 420)
+$form.ClientSize    = New-Object System.Drawing.Size(660, 550)
+$form.MinimumSize   = New-Object System.Drawing.Size(580, 450)
 $script:MainForm    = $form
 $script:StrikeFont  = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Strikeout)
 
@@ -851,11 +917,35 @@ $chkAuto.Add_Click({
 })
 $form.Controls.Add($chkAuto)
 
+$lbl = New-Object System.Windows.Forms.Label
+$lbl.Text     = 'Kje se pokaže opomnik:'
+$lbl.AutoSize = $true
+$lbl.Location = New-Object System.Drawing.Point(12, 492)
+$lbl.Anchor   = 'Bottom, Left'
+$form.Controls.Add($lbl)
+
+$cmbPos = New-Object System.Windows.Forms.ComboBox
+$cmbPos.DropDownStyle = 'DropDownList'
+$cmbPos.Location      = New-Object System.Drawing.Point(180, 488)
+$cmbPos.Width         = 180
+$cmbPos.Anchor        = 'Bottom, Left'
+foreach ($k in $script:PositionNames.Keys) { [void]$cmbPos.Items.Add($script:PositionNames[$k]) }
+$idx = [array]::IndexOf(@($script:PositionNames.Keys), $script:Settings.Position)
+if ($idx -lt 0) { $idx = 0 }
+$cmbPos.SelectedIndex = $idx
+$cmbPos.Add_SelectedIndexChanged({
+    param($s, $e)
+    $script:Settings.Position = @($script:PositionNames.Keys)[$s.SelectedIndex]
+    Save-Data
+    if ($null -ne $script:AlertForm) { Set-AlertPosition $script:AlertForm }
+})
+$form.Controls.Add($cmbPos)
+
 # --- statusna vrstica
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.AutoSize    = $false
 $lblStatus.UseMnemonic = $false
-$lblStatus.Location    = New-Object System.Drawing.Point(12, 490)
+$lblStatus.Location    = New-Object System.Drawing.Point(12, 522)
 $lblStatus.Size        = New-Object System.Drawing.Size(636, 24)
 $lblStatus.Anchor      = 'Bottom, Left, Right'
 $lblStatus.Font        = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
@@ -921,6 +1011,8 @@ $script:CheckTimer.Add_Tick({
             $script:DtDate.Value = $script:LastDay
             Refresh-List
         }
+
+        if (Test-AlertObsolete) { Close-Alert 'none' }
 
         if ($null -eq $script:AlertTask) {
             $next = Get-NextDueTask
